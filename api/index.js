@@ -2,6 +2,7 @@ const mongoose = require('mongoose');
 const userSchema = require('../user');
 const enigmaUserSchema = require('../enigmaUser');
 const { connectGenwavDb, connectEnigmaDb } = require('../connectdb');
+const leadsRouter = require('../leads');
 const cors = require('cors');
 const express = require('express');
 const serverless = require('serverless-http');
@@ -289,6 +290,8 @@ app.post('/addUserEnigma', async (req, res) => {
     res.status(400).json({ error: error.message });
   }
 });
+
+app.use('/api/leads', leadsRouter);
 
 app.use('/api', router);
 
