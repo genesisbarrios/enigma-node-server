@@ -1,8 +1,11 @@
 const mongoose = require('mongoose');
 const userSchema = require('../user');
 const enigmaUserSchema = require('../enigmaUser');
-const { connectGenwavDb, connectEnigmaDb } = require('../connectdb');
+const crmClientSchema = require('../crmClient');
+const crmSubscriberSchema = require('../crmSubscriber');
+const { connectGenwavDb, connectEnigmaDb, connectEnigmaCrmDb } = require('../connectdb');
 const leadsRouter = require('../leads');
+const { sendContactNotification } = require('../email');
 const cors = require('cors');
 const express = require('express');
 const serverless = require('serverless-http');
@@ -18,7 +21,22 @@ const corsOptions = {
       'https://localhost:3000',
       'https://127.0.0.1:3000',
       'https://enigma-labs.com',
-      'https://www.enigma-labs.com'
+      'https://www.enigma-labs.com',
+      'https://monarkbarbershop.com',
+      'https://www.monarkbarbershop.com',
+      'https://monarkbarbershop.vercel.app',
+      'https://javierhardscapingdesign.com',
+      'https://www.javierhardscapingdesign.com',
+      'https://javier-hardscaping-design.vercel.app',
+      'https://jajasplate.com',
+      'https://www.jajasplate.com',
+      'https://jajas-plate.vercel.app',
+      'https://prettykittymiamirescue.org',
+      'https://www.prettykittymiamirescue.org',
+      'https://pretty-kitty-miami-dade-rescue.vercel.app',
+      'https://imperialdialoguestudios.com',
+      'https://www.imperialdialoguestudios.com',
+      'https://imperial-dialogue-studios.vercel.app'
     ];
 
     if (!origin || allowedOrigins.includes(origin)) {
@@ -83,6 +101,8 @@ let UserModel;
 let EnigmaUserModel;
 let NewsletterSubscriberModel;
 let OnboardingClientModel;
+let CrmClientModel;
+let CrmSubscriberModel;
 
 async function ensureModels() {
   if (!UserModel) {
@@ -101,11 +121,19 @@ async function ensureModels() {
     OnboardingClientModel = enigmaConnection.model('OnboardingClient', onboardingClientSchema, 'onboard');
   }
 
+  if (!CrmClientModel || !CrmSubscriberModel) {
+    const enigmaCrmConnection = await connectEnigmaCrmDb();
+    CrmClientModel = enigmaCrmConnection.model('CrmClient', crmClientSchema, 'clients');
+    CrmSubscriberModel = enigmaCrmConnection.model('CrmSubscriber', crmSubscriberSchema, 'subscribers');
+  }
+
   return {
     UserModel,
     EnigmaUserModel,
     NewsletterSubscriberModel,
-    OnboardingClientModel
+    OnboardingClientModel,
+    CrmClientModel,
+    CrmSubscriberModel
   };
 }
 
@@ -225,6 +253,191 @@ app.delete('/api/onboarding/clients/:id', async (req, res) => {
   } catch (error) {
     console.error('Could not delete client', error);
     res.status(500).json({ ok: false, message: 'Could not delete client.' });
+  }
+});
+
+// --- ENIGMA_CRM: client website contact forms + newsletter signups ---
+
+// Master password works across every client (used for internal/ops access
+// and to bootstrap a client's own password). Each client can additionally
+// have its own adminPassword on its CrmClient record, checked below, so
+// client A's password never grants access to client B's data.
+const MASTER_ADMIN_PASSWORD = process.env.CRM_ADMIN_PASSWORD || 'pw';
+
+async function requireClientAdminPassword(req, res, next) {
+  try {
+    const submitted = req.headers['x-admin-password'];
+    if (!submitted) {
+      return res.status(401).json({ ok: false, message: 'Invalid admin password.' });
+    }
+    if (submitted === MASTER_ADMIN_PASSWORD) {
+      return next();
+    }
+
+    const clientSlug = (req.params.slug || req.body.clientSlug || '').trim();
+    if (!clientSlug) {
+      return res.status(401).json({ ok: false, message: 'Invalid admin password.' });
+    }
+
+    const { CrmClientModel } = await ensureModels();
+    const client = await CrmClientModel.findOne({ slug: clientSlug });
+    if (client && client.adminPassword && submitted === client.adminPassword) {
+      return next();
+    }
+
+    return res.status(401).json({ ok: false, message: 'Invalid admin password.' });
+  } catch (error) {
+    console.error('Admin password check failed', error);
+    res.status(500).json({ ok: false, message: 'Could not verify admin password.' });
+  }
+}
+
+app.post('/api/crm/contact', async (req, res) => {
+  try {
+    const { CrmClientModel, CrmSubscriberModel } = await ensureModels();
+
+    const clientSlug = (req.body.clientSlug || '').trim();
+    const name = (req.body.name || '').trim();
+    const email = (req.body.email || '').trim();
+    const source = req.body.source === 'newsletter' ? 'newsletter' : 'contact_form';
+
+    if (!clientSlug || !email) {
+      return res.status(400).json({ ok: false, message: 'clientSlug and email are required.' });
+    }
+
+    if (source === 'newsletter') {
+      const existing = await CrmSubscriberModel.findOne({ clientSlug, email, source: 'newsletter' });
+      if (existing) {
+        return res.status(200).json({ ok: true, message: 'Already subscribed.', subscriber: existing });
+      }
+    }
+
+    let client = await CrmClientModel.findOne({ slug: clientSlug });
+    if (!client) {
+      client = await CrmClientModel.create({
+        slug: clientSlug,
+        name: req.body.clientName || clientSlug,
+        contactEmail: req.body.clientContactEmail || '',
+        phone: req.body.clientPhone || '',
+        website: req.body.clientWebsite || '',
+        instagram: req.body.clientInstagram || '',
+        googleBusinessUrl: req.body.clientGoogleBusinessUrl || ''
+      });
+    } else if (req.body.clientContactEmail && !client.contactEmail) {
+      client.contactEmail = req.body.clientContactEmail;
+      await client.save();
+    }
+
+    const phone = (req.body.phone || '').trim();
+    const message = (req.body.message || '').trim();
+
+    const subscriber = await CrmSubscriberModel.create({
+      clientId: client._id,
+      clientSlug,
+      name,
+      email,
+      phone,
+      message,
+      source
+    });
+
+    if (source === 'contact_form') {
+      sendContactNotification({
+        to: client.contactEmail,
+        clientName: client.name,
+        submission: { name, email, phone, message }
+      }).catch((err) => console.error('Contact notification email failed', err));
+    }
+
+    res.status(201).json({ ok: true, subscriber });
+  } catch (error) {
+    console.error('CRM contact submission failed', error);
+    res.status(500).json({ ok: false, message: 'Could not save contact submission.' });
+  }
+});
+
+app.get('/api/crm/clients/:slug/subscribers', requireClientAdminPassword, async (req, res) => {
+  try {
+    const { CrmSubscriberModel } = await ensureModels();
+    const subscribers = await CrmSubscriberModel.find({ clientSlug: req.params.slug }).sort({ createdAt: -1 });
+    res.json({ ok: true, subscribers });
+  } catch (error) {
+    console.error('Could not fetch CRM subscribers', error);
+    res.status(500).json({ ok: false, message: 'Could not fetch subscribers.' });
+  }
+});
+
+app.post('/api/crm/subscribers/import', requireClientAdminPassword, async (req, res) => {
+  try {
+    const { CrmClientModel, CrmSubscriberModel } = await ensureModels();
+
+    const clientSlug = (req.body.clientSlug || '').trim();
+    const rows = Array.isArray(req.body.subscribers) ? req.body.subscribers : [];
+
+    if (!clientSlug || rows.length === 0) {
+      return res.status(400).json({ ok: false, message: 'clientSlug and a non-empty subscribers array are required.' });
+    }
+
+    let client = await CrmClientModel.findOne({ slug: clientSlug });
+    if (!client) {
+      client = await CrmClientModel.create({ slug: clientSlug, name: req.body.clientName || clientSlug });
+    }
+
+    const existingEmails = new Set(
+      (await CrmSubscriberModel.find({ clientSlug }, 'email')).map((s) => s.email)
+    );
+
+    const toInsert = rows
+      .map((row) => ({
+        clientId: client._id,
+        clientSlug,
+        name: (row.name || '').trim(),
+        email: (row.email || '').trim(),
+        phone: (row.phone || '').trim(),
+        message: (row.message || '').trim(),
+        source: 'import'
+      }))
+      .filter((row) => row.email && !existingEmails.has(row.email));
+
+    const inserted = toInsert.length > 0 ? await CrmSubscriberModel.insertMany(toInsert) : [];
+
+    res.status(201).json({ ok: true, insertedCount: inserted.length, skippedCount: rows.length - inserted.length });
+  } catch (error) {
+    console.error('CRM subscriber import failed', error);
+    res.status(500).json({ ok: false, message: 'Could not import subscribers.' });
+  }
+});
+
+// Master-password only: sets or rotates a single client's own admin
+// password, so each client site can have a distinct password instead of
+// sharing the master one.
+app.patch('/api/crm/clients/:slug/admin-password', async (req, res) => {
+  try {
+    if (req.headers['x-admin-password'] !== MASTER_ADMIN_PASSWORD) {
+      return res.status(401).json({ ok: false, message: 'Invalid admin password.' });
+    }
+
+    const clientSlug = (req.params.slug || '').trim();
+    const newPassword = (req.body.newPassword || '').trim();
+    if (!clientSlug || !newPassword) {
+      return res.status(400).json({ ok: false, message: 'clientSlug and newPassword are required.' });
+    }
+
+    const { CrmClientModel } = await ensureModels();
+    const client = await CrmClientModel.findOneAndUpdate(
+      { slug: clientSlug },
+      { adminPassword: newPassword },
+      { new: true }
+    );
+
+    if (!client) {
+      return res.status(404).json({ ok: false, message: 'Client not found.' });
+    }
+
+    res.json({ ok: true, message: 'Admin password updated.' });
+  } catch (error) {
+    console.error('Could not update client admin password', error);
+    res.status(500).json({ ok: false, message: 'Could not update admin password.' });
   }
 });
 

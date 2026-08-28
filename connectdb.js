@@ -10,6 +10,8 @@ const GENWAV_MONGODB_URI = process.env.MONGODB_URI || process.env.MONGO_URI || '
 const GENWAV_MONGODB_DB = process.env.MONGODB_DB || null;
 const ENIGMA_MONGODB_URI = process.env.ENIGMA_MONGODB_URI || process.env.MONGODB_URI || process.env.MONGO_URI || 'mongodb://127.0.0.1:27017/enigma';
 const ENIGMA_MONGODB_DB = process.env.ENIGMA_MONGODB_DB || process.env.MONGODB_DB || null;
+// ENIGMA_CRM lives on the same cluster as the enigma DB, just under its own database name.
+const ENIGMA_CRM_MONGODB_DB = process.env.ENIGMA_CRM_MONGODB_DB || 'ENIGMA_CRM';
 
 const globalWithMongoose = global;
 if (!globalWithMongoose.mongoose) {
@@ -17,7 +19,9 @@ if (!globalWithMongoose.mongoose) {
     genwavConn: null,
     genwavPromise: null,
     enigmaConn: null,
-    enigmaPromise: null
+    enigmaPromise: null,
+    enigmaCrmConn: null,
+    enigmaCrmPromise: null
   };
 }
 
@@ -51,6 +55,20 @@ const connectEnigmaDb = async () => {
   return cached.enigmaConn;
 };
 
+const connectEnigmaCrmDb = async () => {
+  if (cached.enigmaCrmConn?.readyState >= 1) {
+    return cached.enigmaCrmConn;
+  }
+
+  if (!cached.enigmaCrmPromise) {
+    cached.enigmaCrmPromise = mongoose.createConnection(ENIGMA_MONGODB_URI, { dbName: ENIGMA_CRM_MONGODB_DB }).asPromise();
+  }
+
+  cached.enigmaCrmConn = await cached.enigmaCrmPromise;
+  return cached.enigmaCrmConn;
+};
+
 module.exports = connectGenwavDb;
 module.exports.connectGenwavDb = connectGenwavDb;
 module.exports.connectEnigmaDb = connectEnigmaDb;
+module.exports.connectEnigmaCrmDb = connectEnigmaCrmDb;
