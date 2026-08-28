@@ -5,7 +5,7 @@ const crmClientSchema = require('../crmClient');
 const crmSubscriberSchema = require('../crmSubscriber');
 const { connectGenwavDb, connectEnigmaDb, connectEnigmaCrmDb } = require('../connectdb');
 const leadsRouter = require('../leads');
-const { sendContactNotification } = require('../email');
+const { sendContactNotification, sendThankYouEmail } = require('../email');
 const cors = require('cors');
 const express = require('express');
 const serverless = require('serverless-http');
@@ -323,9 +323,21 @@ app.post('/api/crm/contact', async (req, res) => {
         instagram: req.body.clientInstagram || '',
         googleBusinessUrl: req.body.clientGoogleBusinessUrl || ''
       });
-    } else if (req.body.clientContactEmail && !client.contactEmail) {
-      client.contactEmail = req.body.clientContactEmail;
-      await client.save();
+    } else {
+      // Sync from whatever the site's own config just sent — the form is the
+      // source of truth, so this self-heals a stale value saved on an
+      // earlier submission (e.g. an old client record saved without "www.",
+      // which broke the hero image URL built from client.website below).
+      let dirty = false;
+      if (req.body.clientContactEmail && client.contactEmail !== req.body.clientContactEmail) {
+        client.contactEmail = req.body.clientContactEmail;
+        dirty = true;
+      }
+      if (req.body.clientWebsite && client.website !== req.body.clientWebsite) {
+        client.website = req.body.clientWebsite;
+        dirty = true;
+      }
+      if (dirty) await client.save();
     }
 
     const phone = (req.body.phone || '').trim();
@@ -348,6 +360,21 @@ app.post('/api/crm/contact', async (req, res) => {
         submission: { name, email, phone, message }
       }).catch((err) => console.error('Contact notification email failed', err));
     }
+
+    const website = req.body.clientWebsite || client.website || '';
+    const siteUrl = website ? (website.startsWith('http') ? website : `https://${website}`) : '';
+
+    sendThankYouEmail({
+      to: email,
+      name,
+      clientName: client.name,
+      source,
+      siteUrl,
+      donateUrl: req.body.clientDonateUrl || '',
+      getInvolvedUrl: req.body.clientGetInvolvedUrl || '',
+      heroImageUrl: siteUrl ? `${siteUrl}/hero.jpg` : '',
+      replyTo: client.contactEmail || ''
+    }).catch((err) => console.error('Thank-you email failed', err));
 
     res.status(201).json({ ok: true, subscriber });
   } catch (error) {
