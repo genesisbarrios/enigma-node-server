@@ -401,6 +401,50 @@ app.get('/api/crm/clients/:slug/subscribers', requireClientAdminPassword, async 
   }
 });
 
+// Admin's "+ Add Contact" button — a single manual add, distinct from the
+// public /api/crm/contact route (no thank-you/notification emails fire
+// here) and from /api/crm/subscribers/import (which is bulk, source
+// always "import"). Lets the admin pick any source and set interests.
+app.post('/api/crm/subscribers', requireClientAdminPassword, async (req, res) => {
+  try {
+    const { CrmClientModel, CrmSubscriberModel } = await ensureModels();
+
+    const clientSlug = (req.body.clientSlug || '').trim();
+    const email = (req.body.email || '').trim();
+    if (!clientSlug || !email) {
+      return res.status(400).json({ ok: false, message: 'clientSlug and email are required.' });
+    }
+
+    const client = await CrmClientModel.findOne({ slug: clientSlug });
+    if (!client) {
+      return res.status(404).json({ ok: false, message: 'Client not found.' });
+    }
+
+    const existing = await CrmSubscriberModel.findOne({ clientSlug, email });
+    if (existing) {
+      return res.status(200).json({ ok: true, subscriber: existing, duplicate: true, message: 'A contact with this email already exists.' });
+    }
+
+    const subscriber = await CrmSubscriberModel.create({
+      clientId: client._id,
+      clientSlug,
+      name: (req.body.name || '').trim(),
+      email,
+      phone: (req.body.phone || '').trim(),
+      message: (req.body.message || '').trim(),
+      source: ['contact_form', 'newsletter', 'import'].includes(req.body.source) ? req.body.source : 'contact_form',
+      interestedAdopting: Boolean(req.body.interestedAdopting),
+      interestedFostering: Boolean(req.body.interestedFostering),
+      interestedVolunteering: Boolean(req.body.interestedVolunteering)
+    });
+
+    res.status(201).json({ ok: true, subscriber });
+  } catch (error) {
+    console.error('Could not add CRM subscriber', error);
+    res.status(500).json({ ok: false, message: 'Could not add contact.' });
+  }
+});
+
 // Edit a subscriber's own info — the admin table's Edit button. Scoped to
 // the subscriber's own clientSlug so one client's admin password can't be
 // used to edit another client's contact.
