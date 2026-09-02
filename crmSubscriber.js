@@ -26,6 +26,12 @@ const crmSubscriberSchema = new Schema(
       enum: ["contact_form", "newsletter", "import"],
       default: "contact_form",
     },
+    // Rescue-specific interest checkboxes from the contact form — optional
+    // per client (a client whose form doesn't ask these just never sets
+    // them), shown as badges in the admin subscribers table.
+    interestedAdopting: { type: Boolean, default: false },
+    interestedFostering: { type: Boolean, default: false },
+    interestedVolunteering: { type: Boolean, default: false },
   },
   {
     timestamps: true,

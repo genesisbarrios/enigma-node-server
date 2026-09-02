@@ -3,9 +3,10 @@ const userSchema = require('../user');
 const enigmaUserSchema = require('../enigmaUser');
 const crmClientSchema = require('../crmClient');
 const crmSubscriberSchema = require('../crmSubscriber');
+const crmCampaignSchema = require('../crmCampaign');
 const { connectGenwavDb, connectEnigmaDb, connectEnigmaCrmDb } = require('../connectdb');
 const leadsRouter = require('../leads');
-const { sendContactNotification, sendThankYouEmail } = require('../email');
+const { sendContactNotification, sendThankYouEmail, sendCrmCampaignEmail } = require('../email');
 const cors = require('cors');
 const express = require('express');
 const serverless = require('serverless-http');
@@ -103,6 +104,7 @@ let NewsletterSubscriberModel;
 let OnboardingClientModel;
 let CrmClientModel;
 let CrmSubscriberModel;
+let CrmCampaignModel;
 
 async function ensureModels() {
   if (!UserModel) {
@@ -121,10 +123,11 @@ async function ensureModels() {
     OnboardingClientModel = enigmaConnection.model('OnboardingClient', onboardingClientSchema, 'onboard');
   }
 
-  if (!CrmClientModel || !CrmSubscriberModel) {
+  if (!CrmClientModel || !CrmSubscriberModel || !CrmCampaignModel) {
     const enigmaCrmConnection = await connectEnigmaCrmDb();
     CrmClientModel = enigmaCrmConnection.model('CrmClient', crmClientSchema, 'clients');
     CrmSubscriberModel = enigmaCrmConnection.model('CrmSubscriber', crmSubscriberSchema, 'subscribers');
+    CrmCampaignModel = enigmaCrmConnection.model('CrmCampaign', crmCampaignSchema, 'campaigns');
   }
 
   return {
@@ -133,7 +136,8 @@ async function ensureModels() {
     NewsletterSubscriberModel,
     OnboardingClientModel,
     CrmClientModel,
-    CrmSubscriberModel
+    CrmSubscriberModel,
+    CrmCampaignModel
   };
 }
 
@@ -350,7 +354,10 @@ app.post('/api/crm/contact', async (req, res) => {
       email,
       phone,
       message,
-      source
+      source,
+      interestedAdopting: Boolean(req.body.interestedAdopting),
+      interestedFostering: Boolean(req.body.interestedFostering),
+      interestedVolunteering: Boolean(req.body.interestedVolunteering)
     });
 
     if (source === 'contact_form') {
@@ -391,6 +398,181 @@ app.get('/api/crm/clients/:slug/subscribers', requireClientAdminPassword, async 
   } catch (error) {
     console.error('Could not fetch CRM subscribers', error);
     res.status(500).json({ ok: false, message: 'Could not fetch subscribers.' });
+  }
+});
+
+// Edit a subscriber's own info — the admin table's Edit button. Scoped to
+// the subscriber's own clientSlug so one client's admin password can't be
+// used to edit another client's contact.
+app.patch('/api/crm/subscribers/:id', requireClientAdminPassword, async (req, res) => {
+  try {
+    const { CrmSubscriberModel } = await ensureModels();
+    const subscriber = await CrmSubscriberModel.findById(req.params.id);
+    if (!subscriber) {
+      return res.status(404).json({ ok: false, message: 'Subscriber not found.' });
+    }
+    if (req.body.clientSlug && subscriber.clientSlug !== req.body.clientSlug) {
+      return res.status(403).json({ ok: false, message: 'Subscriber does not belong to this client.' });
+    }
+
+    const fields = ['name', 'email', 'phone', 'message', 'source', 'interestedAdopting', 'interestedFostering', 'interestedVolunteering'];
+    fields.forEach((field) => {
+      if (req.body[field] !== undefined) subscriber[field] = req.body[field];
+    });
+    await subscriber.save();
+
+    res.json({ ok: true, subscriber });
+  } catch (error) {
+    console.error('Could not update CRM subscriber', error);
+    res.status(500).json({ ok: false, message: 'Could not update subscriber.' });
+  }
+});
+
+app.delete('/api/crm/subscribers/:id', requireClientAdminPassword, async (req, res) => {
+  try {
+    const { CrmSubscriberModel } = await ensureModels();
+    const subscriber = await CrmSubscriberModel.findById(req.params.id);
+    if (!subscriber) {
+      return res.status(404).json({ ok: false, message: 'Subscriber not found.' });
+    }
+    if (req.body.clientSlug && subscriber.clientSlug !== req.body.clientSlug) {
+      return res.status(403).json({ ok: false, message: 'Subscriber does not belong to this client.' });
+    }
+    await CrmSubscriberModel.deleteOne({ _id: subscriber._id });
+    res.json({ ok: true });
+  } catch (error) {
+    console.error('Could not delete CRM subscriber', error);
+    res.status(500).json({ ok: false, message: 'Could not delete subscriber.' });
+  }
+});
+
+// Overall Resend account cap across every client site this backend serves —
+// set to whatever your actual Resend plan's daily send limit is (defaults
+// to Resend's free-tier 100/day). Each client below gets capped to a slice
+// of this shared pool so one client's campaign can't eat everyone else's
+// quota.
+const RESEND_DAILY_LIMIT = Number(process.env.RESEND_DAILY_LIMIT) || 100;
+
+// Per-client share of RESEND_DAILY_LIMIT, as a percent. A client not listed
+// here has no cap enforced. Starting with just prettykitty for now — add
+// other clients' slugs here as their own outreach volume ramps up.
+const CLIENT_DAILY_SEND_LIMIT_PERCENT = {
+  'pretty-kitty-miami-dade-rescue': 5
+};
+
+async function getDailySendLimit(CrmCampaignModel, clientSlug) {
+  const percent = CLIENT_DAILY_SEND_LIMIT_PERCENT[clientSlug];
+  if (percent == null) {
+    return { limit: null, usedToday: 0, remaining: null };
+  }
+
+  const limit = Math.max(1, Math.floor((RESEND_DAILY_LIMIT * percent) / 100));
+
+  const startOfDay = new Date();
+  startOfDay.setHours(0, 0, 0, 0);
+  const todaysCampaigns = await CrmCampaignModel.find({ clientSlug, createdAt: { $gte: startOfDay } }, 'recipients');
+  const usedToday = todaysCampaigns.reduce(
+    (sum, c) => sum + c.recipients.filter((r) => !r.error).length,
+    0
+  );
+
+  return { limit, usedToday, remaining: Math.max(0, limit - usedToday) };
+}
+
+// Shows the admin's current OUTREACH daily send limit (and how much of it
+// is used today) so the panel can display it live and warn before sending.
+app.get('/api/crm/clients/:slug/send-limit', requireClientAdminPassword, async (req, res) => {
+  try {
+    const { CrmCampaignModel } = await ensureModels();
+    const status = await getDailySendLimit(CrmCampaignModel, req.params.slug);
+    res.json({ ok: true, ...status });
+  } catch (error) {
+    console.error('Could not compute send limit', error);
+    res.status(500).json({ ok: false, message: 'Could not compute send limit.' });
+  }
+});
+
+// OUTREACH: send a campaign (or a single 1:1 reply — same pipeline, just one
+// recipient) to an explicit list of subscriber ids. The admin UI resolves
+// "select all" / "select by source" into this same explicit id list before
+// calling here, so what's logged always matches exactly who was emailed.
+app.post('/api/crm/campaigns/send', requireClientAdminPassword, async (req, res) => {
+  try {
+    const { CrmClientModel, CrmSubscriberModel, CrmCampaignModel } = await ensureModels();
+
+    const clientSlug = (req.body.clientSlug || '').trim();
+    const subject = (req.body.subject || '').trim();
+    const html = req.body.html || '';
+    const templateKey = req.body.templateKey || 'custom';
+    const recipientIds = Array.isArray(req.body.recipientIds) ? req.body.recipientIds : [];
+
+    if (!clientSlug || !subject || !html || recipientIds.length === 0) {
+      return res.status(400).json({ ok: false, message: 'clientSlug, subject, html, and at least one recipient are required.' });
+    }
+
+    const client = await CrmClientModel.findOne({ slug: clientSlug });
+    if (!client) {
+      return res.status(404).json({ ok: false, message: 'Client not found.' });
+    }
+
+    // Reject the whole send up front (not partway through) if it would push
+    // this client over its slice of the shared daily Resend limit.
+    const limitStatus = await getDailySendLimit(CrmCampaignModel, clientSlug);
+    if (limitStatus.limit != null && limitStatus.usedToday + recipientIds.length > limitStatus.limit) {
+      return res.status(429).json({
+        ok: false,
+        message: `Sending to ${recipientIds.length} would exceed today's limit of ${limitStatus.limit} (${limitStatus.usedToday} already sent, ${limitStatus.remaining} remaining).`,
+        limitExceeded: true,
+        ...limitStatus
+      });
+    }
+
+    const subscribers = await CrmSubscriberModel.find({ _id: { $in: recipientIds }, clientSlug });
+
+    const recipients = [];
+    for (const subscriber of subscribers) {
+      const result = await sendCrmCampaignEmail({
+        to: subscriber.email,
+        name: subscriber.name,
+        clientName: client.name,
+        subject,
+        html,
+        replyTo: client.contactEmail || ''
+      });
+      recipients.push({
+        subscriberId: subscriber._id,
+        email: subscriber.email,
+        name: subscriber.name,
+        resendId: result.resendId || '',
+        error: result.ok ? '' : (result.error || 'Failed to send')
+      });
+    }
+
+    const campaign = await CrmCampaignModel.create({
+      clientId: client._id,
+      clientSlug,
+      templateKey,
+      subject,
+      html,
+      recipients,
+      recipientCount: recipients.length
+    });
+
+    res.status(201).json({ ok: true, campaign });
+  } catch (error) {
+    console.error('Could not send CRM campaign', error);
+    res.status(500).json({ ok: false, message: 'Could not send campaign.' });
+  }
+});
+
+app.get('/api/crm/clients/:slug/campaigns', requireClientAdminPassword, async (req, res) => {
+  try {
+    const { CrmCampaignModel } = await ensureModels();
+    const campaigns = await CrmCampaignModel.find({ clientSlug: req.params.slug }).sort({ createdAt: -1 });
+    res.json({ ok: true, campaigns });
+  } catch (error) {
+    console.error('Could not fetch CRM campaigns', error);
+    res.status(500).json({ ok: false, message: 'Could not fetch campaigns.' });
   }
 });
 

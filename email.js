@@ -173,4 +173,44 @@ async function sendThankYouEmail({
   return { skipped: false };
 }
 
-module.exports = { sendContactNotification, sendThankYouEmail, buildThankYouEmail };
+// Sends one OUTREACH email (a campaign send or a 1:1 reply) to a single
+// subscriber. "(name)" in the html is mail-merged with their first name —
+// called once per recipient from the campaign-send route since the merge
+// differs per person.
+async function sendCrmCampaignEmail({ to, name, clientName, subject, html, replyTo }) {
+  if (!RESEND_API_KEY) {
+    return { ok: false, skipped: true, error: "RESEND_API_KEY missing" };
+  }
+  if (!to) {
+    return { ok: false, skipped: true, error: "No recipient email" };
+  }
+
+  const firstName = (name || "").trim().split(" ")[0] || "there";
+  const mergedHtml = (html || "").replace(/\(name\)/gi, firstName);
+
+  const res = await fetch("https://api.resend.com/emails", {
+    method: "POST",
+    headers: {
+      Authorization: `Bearer ${RESEND_API_KEY}`,
+      "Content-Type": "application/json",
+    },
+    body: JSON.stringify({
+      from: `${clientName} <crm@enigma-labs.com>`,
+      to,
+      ...(replyTo ? { reply_to: replyTo } : {}),
+      subject,
+      html: mergedHtml,
+    }),
+  });
+
+  if (!res.ok) {
+    const text = await res.text();
+    console.error("Resend campaign email failed", res.status, text);
+    return { ok: false, error: text };
+  }
+
+  const data = await res.json();
+  return { ok: true, resendId: data?.id };
+}
+
+module.exports = { sendContactNotification, sendThankYouEmail, buildThankYouEmail, sendCrmCampaignEmail };
