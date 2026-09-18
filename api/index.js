@@ -296,6 +296,42 @@ async function requireClientAdminPassword(req, res, next) {
   }
 }
 
+function getRequestIp(req) {
+  const forwarded = req.headers['x-forwarded-for'];
+  if (forwarded) return forwarded.split(',')[0].trim();
+  return req.socket?.remoteAddress || req.ip || '';
+}
+
+// Bot defense for the public /api/crm/contact endpoint, shared by every
+// client site's contact form and newsletter signup. Mirrors the same
+// honeypot + timing-trap + IP-flood pattern used elsewhere in this workspace
+// (see enigmalabs/server.js isLikelySpamSubmission) — every client form
+// already sends a hidden "website" field and a formLoadedAt timestamp.
+async function isLikelySpamSubmission(req, CrmSubscriberModel) {
+  // Honeypot: a hidden field real users never see or fill; bots that
+  // auto-fill every input on the page populate it.
+  if (req.body.website) return true;
+
+  // Timing trap: the form reports how long it was open before submit — a
+  // human takes at least a couple seconds to fill even a short form.
+  const formLoadedAt = Number(req.body.formLoadedAt) || 0;
+  if (!formLoadedAt || Date.now() - formLoadedAt < 2000) return true;
+
+  // Per-IP flood limit — more than 5 submissions (any client) from the same
+  // IP in 15 minutes isn't a real prospect.
+  const ip = getRequestIp(req);
+  if (ip) {
+    const fifteenMinAgo = new Date(Date.now() - 15 * 60 * 1000);
+    const recentCount = await CrmSubscriberModel.countDocuments({
+      submittedIp: ip,
+      createdAt: { $gte: fifteenMinAgo },
+    });
+    if (recentCount >= 5) return true;
+  }
+
+  return false;
+}
+
 app.post('/api/crm/contact', async (req, res) => {
   try {
     const { CrmClientModel, CrmSubscriberModel } = await ensureModels();
@@ -307,6 +343,12 @@ app.post('/api/crm/contact', async (req, res) => {
 
     if (!clientSlug || !email) {
       return res.status(400).json({ ok: false, message: 'clientSlug and email are required.' });
+    }
+
+    // Spam responds identically to a real success so scripted abuse gets no
+    // feedback to adapt to — it just silently never becomes a subscriber.
+    if (await isLikelySpamSubmission(req, CrmSubscriberModel)) {
+      return res.status(201).json({ ok: true, message: 'Submission received.' });
     }
 
     if (source === 'newsletter') {
@@ -357,7 +399,19 @@ app.post('/api/crm/contact', async (req, res) => {
       source,
       interestedAdopting: Boolean(req.body.interestedAdopting),
       interestedFostering: Boolean(req.body.interestedFostering),
-      interestedVolunteering: Boolean(req.body.interestedVolunteering)
+      interestedVolunteering: Boolean(req.body.interestedVolunteering),
+      interestedFullGroom: Boolean(req.body.interestedFullGroom),
+      interestedBathBrush: Boolean(req.body.interestedBathBrush),
+      interestedNailTrim: Boolean(req.body.interestedNailTrim),
+      interestedRegular: Boolean(req.body.interestedRegular),
+      interestedPremium: Boolean(req.body.interestedPremium),
+      interestedDiesel: Boolean(req.body.interestedDiesel),
+      interestedTNR: Boolean(req.body.interestedTNR),
+      interestedStrays: Boolean(req.body.interestedStrays),
+      interestedPodcast: Boolean(req.body.interestedPodcast),
+      interestedVideo: Boolean(req.body.interestedVideo),
+      interestedStudio: Boolean(req.body.interestedStudio),
+      submittedIp: getRequestIp(req)
     });
 
     if (source === 'contact_form') {
@@ -435,7 +489,18 @@ app.post('/api/crm/subscribers', requireClientAdminPassword, async (req, res) =>
       source: ['contact_form', 'newsletter', 'import'].includes(req.body.source) ? req.body.source : 'contact_form',
       interestedAdopting: Boolean(req.body.interestedAdopting),
       interestedFostering: Boolean(req.body.interestedFostering),
-      interestedVolunteering: Boolean(req.body.interestedVolunteering)
+      interestedVolunteering: Boolean(req.body.interestedVolunteering),
+      interestedFullGroom: Boolean(req.body.interestedFullGroom),
+      interestedBathBrush: Boolean(req.body.interestedBathBrush),
+      interestedNailTrim: Boolean(req.body.interestedNailTrim),
+      interestedRegular: Boolean(req.body.interestedRegular),
+      interestedPremium: Boolean(req.body.interestedPremium),
+      interestedDiesel: Boolean(req.body.interestedDiesel),
+      interestedTNR: Boolean(req.body.interestedTNR),
+      interestedStrays: Boolean(req.body.interestedStrays),
+      interestedPodcast: Boolean(req.body.interestedPodcast),
+      interestedVideo: Boolean(req.body.interestedVideo),
+      interestedStudio: Boolean(req.body.interestedStudio)
     });
 
     res.status(201).json({ ok: true, subscriber });
@@ -459,7 +524,7 @@ app.patch('/api/crm/subscribers/:id', requireClientAdminPassword, async (req, re
       return res.status(403).json({ ok: false, message: 'Subscriber does not belong to this client.' });
     }
 
-    const fields = ['name', 'email', 'phone', 'message', 'source', 'interestedAdopting', 'interestedFostering', 'interestedVolunteering'];
+    const fields = ['name', 'email', 'phone', 'message', 'source', 'interestedAdopting', 'interestedFostering', 'interestedVolunteering', 'interestedFullGroom', 'interestedBathBrush', 'interestedNailTrim', 'interestedRegular', 'interestedPremium', 'interestedDiesel', 'interestedTNR', 'interestedStrays', 'interestedPodcast', 'interestedVideo', 'interestedStudio'];
     fields.forEach((field) => {
       if (req.body[field] !== undefined) subscriber[field] = req.body[field];
     });

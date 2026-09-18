@@ -26,12 +26,33 @@ const crmSubscriberSchema = new Schema(
       enum: ["contact_form", "newsletter", "import"],
       default: "contact_form",
     },
-    // Rescue-specific interest checkboxes from the contact form — optional
-    // per client (a client whose form doesn't ask these just never sets
-    // them), shown as badges in the admin subscribers table.
+    // Per-client interest checkboxes from the contact form — optional per
+    // client (a client whose form doesn't ask these just never sets them),
+    // shown as badges in the admin subscribers table. Field names are
+    // specific to whichever client first needed them (prettykitty's
+    // adopt/foster/volunteer, emepetgrooming's service types, ftlfuel's fuel
+    // types, etc.) — add more of the same shape for a new client's own
+    // categories.
     interestedAdopting: { type: Boolean, default: false },
     interestedFostering: { type: Boolean, default: false },
     interestedVolunteering: { type: Boolean, default: false },
+    interestedFullGroom: { type: Boolean, default: false },
+    interestedBathBrush: { type: Boolean, default: false },
+    interestedNailTrim: { type: Boolean, default: false },
+    interestedRegular: { type: Boolean, default: false },
+    interestedPremium: { type: Boolean, default: false },
+    interestedDiesel: { type: Boolean, default: false },
+    // Pretty Kitty-specific — someone reporting/needing help with a stray
+    // cat (TNR = trap-neuter-return) rather than adopting/fostering it.
+    interestedTNR: { type: Boolean, default: false },
+    interestedStrays: { type: Boolean, default: false },
+    // Imperial Dialogue Studios-specific — the three services offered.
+    interestedPodcast: { type: Boolean, default: false },
+    interestedVideo: { type: Boolean, default: false },
+    interestedStudio: { type: Boolean, default: false },
+    // IP the submission came from — used only for the spam flood-limit check
+    // in api/index.js (see isLikelySpamSubmission), not shown in the admin UI.
+    submittedIp: String,
   },
   {
     timestamps: true,
