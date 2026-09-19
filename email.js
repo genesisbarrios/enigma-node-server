@@ -1,6 +1,19 @@
 const RESEND_API_KEY = process.env.RESEND_API_KEY;
 const RESEND_FROM = process.env.RESEND_FROM || "Enigma Labs CRM <crm@enigma-labs.com>";
 
+// Pulls just the address out of RESEND_FROM (which may be "Name <addr>" or a
+// bare address) so a per-message display name can be swapped in without
+// hardcoding the sending address separately from the env var.
+const RESEND_FROM_ADDRESS = (RESEND_FROM.match(/<(.+)>/) || [, RESEND_FROM])[1].trim();
+
+// Shows the submitter's name in the inbox at a glance — "Jane Doe via
+// Enigma Labs CRM" instead of just "Enigma Labs CRM" — while the actual
+// sending address (and its SPF/DKIM) stays untouched. Reply-To (set by the
+// caller) is what actually routes a reply to Jane, not this.
+function fromWithSubmitterName(name) {
+  return name ? `${name} via Enigma Labs CRM <${RESEND_FROM_ADDRESS}>` : RESEND_FROM;
+}
+
 // Sends the client (e.g. Monark Barbershop) an email with a new contact form
 // submission's info. Silently no-ops if RESEND_API_KEY isn't configured yet,
 // so a missing email key never blocks saving the lead to the database.
@@ -27,7 +40,7 @@ async function sendContactNotification({ to, clientName, submission, replyTo }) 
       "Content-Type": "application/json",
     },
     body: JSON.stringify({
-      from: RESEND_FROM,
+      from: fromWithSubmitterName(submission.name),
       to,
       subject: `New website contact — ${clientName}`,
       html: `<h2>New contact form submission</h2><table>${rows}</table>`,
