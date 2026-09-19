@@ -302,6 +302,23 @@ function getRequestIp(req) {
   return req.socket?.remoteAddress || req.ip || '';
 }
 
+// Throwaway/disposable inboxes — real prospects don't sign up for a cat
+// rescue's newsletter with a 10-minute burner address; spam bots do it
+// constantly to dodge per-email dedup.
+const DISPOSABLE_EMAIL_DOMAINS = new Set([
+  'mailinator.com', 'guerrillamail.com', 'guerrillamail.info', 'sharklasers.com',
+  'tempmail.com', 'temp-mail.org', 'tempmailo.com', '10minutemail.com', '10minutemail.net',
+  'throwawaymail.com', 'yopmail.com', 'trashmail.com', 'getnada.com', 'fakeinbox.com',
+  'dispostable.com', 'maildrop.cc', 'spam4.me', 'mintemail.com', 'moakt.com',
+  'emailondeck.com', 'mailnesia.com', 'discard.email', 'tempinbox.com',
+  'fakemailgenerator.com', 'mohmal.com', 'crazymailing.com', 'inboxkitten.com', 'burnermail.io'
+]);
+
+// Promo/link spam in a "tell us about yourself" field is essentially never
+// legitimate — real inquiries don't come with a backlink or a casino pitch.
+const SPAM_URL_RE = /https?:\/\/|www\.\S+\.\S{2,}/i;
+const SPAM_KEYWORD_RE = /\b(seo services?|backlinks?|link building|increase your (ranking|traffic)|crypto (invest|trading)|forex trading|payday loans?|bad credit loan|male enhancement|weight loss pills|casino bonus|adult content|bulk email|dropship)\b/i;
+
 // Bot defense for the public /api/crm/contact endpoint, shared by every
 // client site's contact form and newsletter signup. Mirrors the same
 // honeypot + timing-trap + IP-flood pattern used elsewhere in this workspace
@@ -313,12 +330,20 @@ async function isLikelySpamSubmission(req, CrmSubscriberModel) {
   if (req.body.website) return true;
 
   // Timing trap: the form reports how long it was open before submit — a
-  // human takes at least a couple seconds to fill even a short form.
+  // human takes noticeably longer than this to fill name/email/message.
+  // Raised from 2s to 4s since a flat 2s cutoff is trivial for a bot to clear.
   const formLoadedAt = Number(req.body.formLoadedAt) || 0;
-  if (!formLoadedAt || Date.now() - formLoadedAt < 2000) return true;
+  if (!formLoadedAt || Date.now() - formLoadedAt < 4000) return true;
 
-  // Per-IP flood limit — more than 5 submissions (any client) from the same
-  // IP in 15 minutes isn't a real prospect.
+  const email = (req.body.email || '').toLowerCase().trim();
+  const emailDomain = email.split('@')[1] || '';
+  if (DISPOSABLE_EMAIL_DOMAINS.has(emailDomain)) return true;
+
+  const freeText = `${req.body.name || ''} ${req.body.message || ''}`;
+  if (SPAM_URL_RE.test(freeText) || SPAM_KEYWORD_RE.test(freeText)) return true;
+
+  // Per-IP flood limit — tightened from 5 to 3 submissions (any client) from
+  // the same IP in 15 minutes; a real prospect doesn't submit that often.
   const ip = getRequestIp(req);
   if (ip) {
     const fifteenMinAgo = new Date(Date.now() - 15 * 60 * 1000);
@@ -326,7 +351,7 @@ async function isLikelySpamSubmission(req, CrmSubscriberModel) {
       submittedIp: ip,
       createdAt: { $gte: fifteenMinAgo },
     });
-    if (recentCount >= 5) return true;
+    if (recentCount >= 3) return true;
   }
 
   return false;
@@ -418,7 +443,8 @@ app.post('/api/crm/contact', async (req, res) => {
       sendContactNotification({
         to: client.contactEmail,
         clientName: client.name,
-        submission: { name, email, phone, message }
+        submission: { name, email, phone, message },
+        replyTo: email
       }).catch((err) => console.error('Contact notification email failed', err));
     }
 

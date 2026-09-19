@@ -4,7 +4,7 @@ const RESEND_FROM = process.env.RESEND_FROM || "Enigma Labs CRM <crm@enigma-labs
 // Sends the client (e.g. Monark Barbershop) an email with a new contact form
 // submission's info. Silently no-ops if RESEND_API_KEY isn't configured yet,
 // so a missing email key never blocks saving the lead to the database.
-async function sendContactNotification({ to, clientName, submission }) {
+async function sendContactNotification({ to, clientName, submission, replyTo }) {
   if (!RESEND_API_KEY) {
     console.warn("RESEND_API_KEY missing — skipping contact notification email.");
     return { skipped: true };
@@ -31,6 +31,9 @@ async function sendContactNotification({ to, clientName, submission }) {
       to,
       subject: `New website contact — ${clientName}`,
       html: `<h2>New contact form submission</h2><table>${rows}</table>`,
+      // So the client can just hit Reply in their inbox and it goes straight
+      // to the person who submitted the form, not to the CRM's from address.
+      ...(replyTo ? { reply_to: replyTo } : {}),
     }),
   });
 
