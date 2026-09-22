@@ -436,6 +436,9 @@ app.post('/api/crm/contact', async (req, res) => {
       interestedPodcast: Boolean(req.body.interestedPodcast),
       interestedVideo: Boolean(req.body.interestedVideo),
       interestedStudio: Boolean(req.body.interestedStudio),
+      interestedOilChange: Boolean(req.body.interestedOilChange),
+      interestedFullService: Boolean(req.body.interestedFullService),
+      interestedFleetService: Boolean(req.body.interestedFleetService),
       submittedIp: getRequestIp(req)
     });
 
@@ -526,7 +529,10 @@ app.post('/api/crm/subscribers', requireClientAdminPassword, async (req, res) =>
       interestedStrays: Boolean(req.body.interestedStrays),
       interestedPodcast: Boolean(req.body.interestedPodcast),
       interestedVideo: Boolean(req.body.interestedVideo),
-      interestedStudio: Boolean(req.body.interestedStudio)
+      interestedStudio: Boolean(req.body.interestedStudio),
+      interestedOilChange: Boolean(req.body.interestedOilChange),
+      interestedFullService: Boolean(req.body.interestedFullService),
+      interestedFleetService: Boolean(req.body.interestedFleetService)
     });
 
     res.status(201).json({ ok: true, subscriber });
@@ -550,7 +556,7 @@ app.patch('/api/crm/subscribers/:id', requireClientAdminPassword, async (req, re
       return res.status(403).json({ ok: false, message: 'Subscriber does not belong to this client.' });
     }
 
-    const fields = ['name', 'email', 'phone', 'message', 'source', 'interestedAdopting', 'interestedFostering', 'interestedVolunteering', 'interestedFullGroom', 'interestedBathBrush', 'interestedNailTrim', 'interestedRegular', 'interestedPremium', 'interestedDiesel', 'interestedTNR', 'interestedStrays', 'interestedPodcast', 'interestedVideo', 'interestedStudio'];
+    const fields = ['name', 'email', 'phone', 'message', 'source', 'interestedAdopting', 'interestedFostering', 'interestedVolunteering', 'interestedFullGroom', 'interestedBathBrush', 'interestedNailTrim', 'interestedRegular', 'interestedPremium', 'interestedDiesel', 'interestedTNR', 'interestedStrays', 'interestedPodcast', 'interestedVideo', 'interestedStudio', 'interestedOilChange', 'interestedFullService', 'interestedFleetService'];
     fields.forEach((field) => {
       if (req.body[field] !== undefined) subscriber[field] = req.body[field];
     });

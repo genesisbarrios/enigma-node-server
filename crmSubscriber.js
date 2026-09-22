@@ -50,6 +50,10 @@ const crmSubscriberSchema = new Schema(
     interestedPodcast: { type: Boolean, default: false },
     interestedVideo: { type: Boolean, default: false },
     interestedStudio: { type: Boolean, default: false },
+    // MHS Lube-specific — semi truck lube services.
+    interestedOilChange: { type: Boolean, default: false },
+    interestedFullService: { type: Boolean, default: false },
+    interestedFleetService: { type: Boolean, default: false },
     // IP the submission came from — used only for the spam flood-limit check
     // in api/index.js (see isLikelySpamSubmission), not shown in the admin UI.
     submittedIp: String,
