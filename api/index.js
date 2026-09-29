@@ -319,6 +319,36 @@ const DISPOSABLE_EMAIL_DOMAINS = new Set([
 const SPAM_URL_RE = /https?:\/\/|www\.\S+\.\S{2,}/i;
 const SPAM_KEYWORD_RE = /\b(seo services?|backlinks?|link building|increase your (ranking|traffic)|crypto (invest|trading)|forex trading|payday loans?|bad credit loan|male enhancement|weight loss pills|casino bonus|adult content|bulk email|dropship)\b/i;
 
+// Catches keyboard-mash/algorithmically-generated names — the pattern
+// actually reported on prettykittymiami's newsletter signups (real-looking
+// email, gibberish name). This matters specifically for the newsletter form,
+// which has no message field for SPAM_KEYWORD_RE/SPAM_URL_RE to scan, so a
+// bot that clears the honeypot/timing/disposable-domain checks (real Gmail
+// address, one submission per IP, waits out the 4s timer) previously sailed
+// straight through. Deliberately conservative to avoid false-positiving
+// real names:
+//   - digits in a name field are never legitimate
+//   - a run of 5+ consonants in a row doesn't occur in real names (checked
+//     against e.g. "Kirchner", "Nkemdirim" while writing this)
+//   - a name with letters but zero vowels (treating y as a vowel, for
+//     names like "Lynch") isn't a real word
+//   - 2+ lowercase-to-uppercase transitions mid-string is a random-case-
+//     generator fingerprint; requiring 2 (not 1) avoids false-flagging
+//     genuine "Mc"/"Mac"-prefixed names (McDonald has exactly one)
+// An empty/absent name is fine — the field is optional, and a blank isn't
+// evidence of anything.
+function looksLikeGibberishName(name) {
+  const trimmed = (name || '').trim();
+  if (!trimmed) return false;
+  if (/\d/.test(trimmed)) return true;
+  if (/[bcdfghjklmnpqrstvwxz]{5,}/i.test(trimmed)) return true;
+  const letters = trimmed.replace(/[^a-z]/gi, '');
+  if (letters.length >= 4 && !/[aeiouy]/i.test(letters)) return true;
+  const caseTransitions = (trimmed.match(/[a-z][A-Z]/g) || []).length;
+  if (caseTransitions >= 2) return true;
+  return false;
+}
+
 // Bot defense for the public /api/crm/contact endpoint, shared by every
 // client site's contact form and newsletter signup. Mirrors the same
 // honeypot + timing-trap + IP-flood pattern used elsewhere in this workspace
@@ -341,6 +371,8 @@ async function isLikelySpamSubmission(req, CrmSubscriberModel) {
 
   const freeText = `${req.body.name || ''} ${req.body.message || ''}`;
   if (SPAM_URL_RE.test(freeText) || SPAM_KEYWORD_RE.test(freeText)) return true;
+
+  if (looksLikeGibberishName(req.body.name)) return true;
 
   // Per-IP flood limit — tightened from 5 to 3 submissions (any client) from
   // the same IP in 15 minutes; a real prospect doesn't submit that often.
