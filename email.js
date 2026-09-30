@@ -193,7 +193,7 @@ async function sendThankYouEmail({
 // subscriber. "(name)" in the html is mail-merged with their first name —
 // called once per recipient from the campaign-send route since the merge
 // differs per person.
-async function sendCrmCampaignEmail({ to, name, clientName, subject, html, replyTo }) {
+async function sendCrmCampaignEmail({ to, name, clientName, subject, html, replyTo, scheduledAt }) {
   if (!RESEND_API_KEY) {
     return { ok: false, skipped: true, error: "RESEND_API_KEY missing" };
   }
@@ -216,6 +216,10 @@ async function sendCrmCampaignEmail({ to, name, clientName, subject, html, reply
       ...(replyTo ? { reply_to: replyTo } : {}),
       subject,
       html: mergedHtml,
+      // ISO datetime — Resend holds the email and delivers it at this time
+      // instead of immediately. Omitted for a normal send-now (unchanged
+      // behavior for every client that doesn't pass this).
+      ...(scheduledAt ? { scheduled_at: scheduledAt } : {}),
     }),
   });
 

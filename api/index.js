@@ -4,6 +4,8 @@ const enigmaUserSchema = require('../enigmaUser');
 const crmClientSchema = require('../crmClient');
 const crmSubscriberSchema = require('../crmSubscriber');
 const crmCampaignSchema = require('../crmCampaign');
+const crmEventSchema = require('../crmEvent');
+const { createSign } = require('crypto');
 const { connectGenwavDb, connectEnigmaDb, connectEnigmaCrmDb } = require('../connectdb');
 const leadsRouter = require('../leads');
 const { sendContactNotification, sendThankYouEmail, sendCrmCampaignEmail } = require('../email');
@@ -105,6 +107,7 @@ let OnboardingClientModel;
 let CrmClientModel;
 let CrmSubscriberModel;
 let CrmCampaignModel;
+let CrmEventModel;
 
 async function ensureModels() {
   if (!UserModel) {
@@ -123,11 +126,12 @@ async function ensureModels() {
     OnboardingClientModel = enigmaConnection.model('OnboardingClient', onboardingClientSchema, 'onboard');
   }
 
-  if (!CrmClientModel || !CrmSubscriberModel || !CrmCampaignModel) {
+  if (!CrmClientModel || !CrmSubscriberModel || !CrmCampaignModel || !CrmEventModel) {
     const enigmaCrmConnection = await connectEnigmaCrmDb();
     CrmClientModel = enigmaCrmConnection.model('CrmClient', crmClientSchema, 'clients');
     CrmSubscriberModel = enigmaCrmConnection.model('CrmSubscriber', crmSubscriberSchema, 'subscribers');
     CrmCampaignModel = enigmaCrmConnection.model('CrmCampaign', crmCampaignSchema, 'campaigns');
+    CrmEventModel = enigmaCrmConnection.model('CrmEvent', crmEventSchema, 'events');
   }
 
   return {
@@ -137,7 +141,8 @@ async function ensureModels() {
     OnboardingClientModel,
     CrmClientModel,
     CrmSubscriberModel,
-    CrmCampaignModel
+    CrmCampaignModel,
+    CrmEventModel
   };
 }
 
@@ -683,6 +688,21 @@ app.post('/api/crm/campaigns/send', requireClientAdminPassword, async (req, res)
       return res.status(400).json({ ok: false, message: 'clientSlug, subject, html, and at least one recipient are required.' });
     }
 
+    // Optional — an ISO datetime from the admin's schedule picker. Resend
+    // holds each recipient's email and delivers it at this time instead of
+    // right away. Left out (or blank) sends immediately, same as before.
+    let scheduledAt;
+    if (req.body.scheduledAt) {
+      const parsed = new Date(req.body.scheduledAt);
+      if (Number.isNaN(parsed.getTime())) {
+        return res.status(400).json({ ok: false, message: 'Invalid scheduled time.' });
+      }
+      if (parsed.getTime() <= Date.now()) {
+        return res.status(400).json({ ok: false, message: 'Scheduled time must be in the future.' });
+      }
+      scheduledAt = parsed.toISOString();
+    }
+
     const client = await CrmClientModel.findOne({ slug: clientSlug });
     if (!client) {
       return res.status(404).json({ ok: false, message: 'Client not found.' });
@@ -710,7 +730,8 @@ app.post('/api/crm/campaigns/send', requireClientAdminPassword, async (req, res)
         clientName: client.name,
         subject,
         html,
-        replyTo: client.contactEmail || ''
+        replyTo: client.contactEmail || '',
+        scheduledAt
       });
       recipients.push({
         subscriberId: subscriber._id,
@@ -728,7 +749,8 @@ app.post('/api/crm/campaigns/send', requireClientAdminPassword, async (req, res)
       subject,
       html,
       recipients,
-      recipientCount: recipients.length
+      recipientCount: recipients.length,
+      scheduledAt
     });
 
     res.status(201).json({ ok: true, campaign });
@@ -889,6 +911,292 @@ app.post('/addUserEnigma', async (req, res) => {
 app.use('/api/leads', leadsRouter);
 
 app.use('/api', router);
+
+// ── Mailing List & Analytics ──────────────────────────────────────────────
+// Click tracking, per-client tracking IDs (GTM / GA4 / Meta Pixel), and
+// GA4 + Search Console reports for each client site's admin.
+
+const CRM_EVENT_TYPES = ['phone_click', 'email_click', 'social_click'];
+
+// Public tag IDs get injected into every page's <script>, so they're
+// strictly validated here — never trust admin input inside a script tag.
+const TRACKING_FIELD_PATTERNS = {
+  gtmId: /^GTM-[A-Z0-9]{4,12}$/,
+  gaMeasurementId: /^G-[A-Z0-9]{4,15}$/,
+  metaPixelId: /^\d{8,20}$/,
+  gaPropertyId: /^\d{5,15}$/,
+  searchConsoleSiteUrl: /^(sc-domain:[a-z0-9.-]+\.[a-z]{2,}|https?:\/\/[^\s"'<>]+\/)$/i,
+};
+
+function clientTrackingSettings(client) {
+  const out = {};
+  for (const key of Object.keys(TRACKING_FIELD_PATTERNS)) out[key] = (client && client[key]) || '';
+  return out;
+}
+
+// Recorded server-to-server by each site's /api/crm/events proxy.
+app.post('/api/crm/events', async (req, res) => {
+  try {
+    const { CrmClientModel, CrmEventModel } = await ensureModels();
+    const clientSlug = String(req.body.clientSlug || '').trim();
+    const type = String(req.body.type || '');
+    if (!/^[a-z0-9-]{2,60}$/.test(clientSlug) || !CRM_EVENT_TYPES.includes(type)) {
+      return res.status(400).json({ ok: false, message: 'Invalid event.' });
+    }
+    // Same as /api/crm/contact: a client's first activity creates its record.
+    await CrmClientModel.updateOne(
+      { slug: clientSlug },
+      { $setOnInsert: { slug: clientSlug, name: String(req.body.clientName || clientSlug).slice(0, 100) } },
+      { upsert: true }
+    );
+    await CrmEventModel.create({
+      clientSlug,
+      type,
+      label: String(req.body.label || '').slice(0, 60),
+      path: String(req.body.path || '').slice(0, 200),
+    });
+    res.status(201).json({ ok: true });
+  } catch (error) {
+    console.error('Could not record CRM event', error);
+    res.status(500).json({ ok: false, message: 'Could not record event.' });
+  }
+});
+
+// Internal analytics cards: signups/submissions from subscribers, clicks
+// from events. ?days=N limits to the last N days (default: all time).
+app.get('/api/crm/clients/:slug/stats', requireClientAdminPassword, async (req, res) => {
+  try {
+    const { CrmSubscriberModel, CrmEventModel } = await ensureModels();
+    const slug = req.params.slug;
+    const days = Math.min(Math.max(parseInt(req.query.days, 10) || 0, 0), 3650);
+    const since = days ? { createdAt: { $gte: new Date(Date.now() - days * 86400000) } } : {};
+
+    const [newsletterSignups, contactSubmissions, clickGroups, socialGroups] = await Promise.all([
+      CrmSubscriberModel.countDocuments({ clientSlug: slug, source: 'newsletter', ...since }),
+      CrmSubscriberModel.countDocuments({ clientSlug: slug, source: 'contact_form', ...since }),
+      CrmEventModel.aggregate([{ $match: { clientSlug: slug, ...since } }, { $group: { _id: '$type', n: { $sum: 1 } } }]),
+      CrmEventModel.aggregate([
+        { $match: { clientSlug: slug, type: 'social_click', ...since } },
+        { $group: { _id: '$label', n: { $sum: 1 } } },
+        { $sort: { n: -1 } },
+      ]),
+    ]);
+    const clicks = Object.fromEntries(clickGroups.map((g) => [g._id, g.n]));
+    res.json({
+      ok: true,
+      days,
+      newsletterSignups,
+      contactSubmissions,
+      phoneClicks: clicks.phone_click || 0,
+      emailClicks: clicks.email_click || 0,
+      socialClicks: clicks.social_click || 0,
+      socialBreakdown: socialGroups.map((g) => ({ label: g._id || 'other', count: g.n })),
+    });
+  } catch (error) {
+    console.error('Could not load CRM stats', error);
+    res.status(500).json({ ok: false, message: 'Could not load stats.' });
+  }
+});
+
+// Public: the tag IDs a site loads on every page. Only the three public
+// IDs — never the property ID or Search Console URL.
+app.get('/api/crm/clients/:slug/tracking', async (req, res) => {
+  try {
+    const { CrmClientModel } = await ensureModels();
+    const client = await CrmClientModel.findOne({ slug: req.params.slug }).lean();
+    const { gtmId, gaMeasurementId, metaPixelId } = clientTrackingSettings(client);
+    res.set('Cache-Control', 'public, max-age=60');
+    res.json({ ok: true, gtmId, gaMeasurementId, metaPixelId });
+  } catch (error) {
+    console.error('Could not load tracking IDs', error);
+    res.status(500).json({ ok: false, message: 'Could not load tracking IDs.' });
+  }
+});
+
+app.get('/api/crm/clients/:slug/settings', requireClientAdminPassword, async (req, res) => {
+  try {
+    const { CrmClientModel } = await ensureModels();
+    const client = await CrmClientModel.findOne({ slug: req.params.slug }).lean();
+    res.json({
+      ok: true,
+      settings: clientTrackingSettings(client),
+      serviceAccountEmail: process.env.GOOGLE_SERVICE_ACCOUNT_EMAIL || '',
+    });
+  } catch (error) {
+    console.error('Could not load client settings', error);
+    res.status(500).json({ ok: false, message: 'Could not load settings.' });
+  }
+});
+
+app.patch('/api/crm/clients/:slug/settings', requireClientAdminPassword, async (req, res) => {
+  try {
+    const { CrmClientModel } = await ensureModels();
+    const updates = {};
+    for (const [key, pattern] of Object.entries(TRACKING_FIELD_PATTERNS)) {
+      if (req.body[key] === undefined) continue;
+      const value = String(req.body[key] || '').trim();
+      if (value && !pattern.test(value)) {
+        return res.status(400).json({ ok: false, field: key, message: `That ${key} doesn't look right.` });
+      }
+      updates[key] = value;
+    }
+    const client = await CrmClientModel.findOneAndUpdate(
+      { slug: req.params.slug },
+      { $set: updates, $setOnInsert: { slug: req.params.slug, name: req.params.slug } },
+      { new: true, upsert: true }
+    ).lean();
+    res.json({ ok: true, settings: clientTrackingSettings(client) });
+  } catch (error) {
+    console.error('Could not save client settings', error);
+    res.status(500).json({ ok: false, message: 'Could not save settings.' });
+  }
+});
+
+// Google service-account auth (JWT bearer flow) — no googleapis dependency.
+// Each client grants GOOGLE_SERVICE_ACCOUNT_EMAIL Viewer access to their GA4
+// property and a user on their Search Console property.
+let googleTokenCache = { token: '', expiresAt: 0 };
+async function getGoogleAccessToken() {
+  if (googleTokenCache.token && googleTokenCache.expiresAt > Date.now() + 60000) return googleTokenCache.token;
+  const email = process.env.GOOGLE_SERVICE_ACCOUNT_EMAIL;
+  const key = (process.env.GOOGLE_SERVICE_ACCOUNT_KEY || '').replace(/\\n/g, '\n');
+  if (!email || !key) return '';
+  const now = Math.floor(Date.now() / 1000);
+  const b64 = (obj) => Buffer.from(JSON.stringify(obj)).toString('base64url');
+  const unsigned = `${b64({ alg: 'RS256', typ: 'JWT' })}.${b64({
+    iss: email,
+    scope: 'https://www.googleapis.com/auth/analytics.readonly https://www.googleapis.com/auth/webmasters.readonly',
+    aud: 'https://oauth2.googleapis.com/token',
+    iat: now,
+    exp: now + 3600,
+  })}`;
+  const signature = createSign('RSA-SHA256').update(unsigned).sign(key).toString('base64url');
+  const res = await fetch('https://oauth2.googleapis.com/token', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+    body: new URLSearchParams({ grant_type: 'urn:ietf:params:oauth:grant-type:jwt-bearer', assertion: `${unsigned}.${signature}` }),
+  });
+  const data = await res.json();
+  if (!res.ok || !data.access_token) throw new Error(`Google auth failed: ${data.error_description || data.error || res.status}`);
+  googleTokenCache = { token: data.access_token, expiresAt: Date.now() + (data.expires_in || 3600) * 1000 };
+  return data.access_token;
+}
+
+async function runGaReport(token, propertyId, body) {
+  const res = await fetch(`https://analyticsdata.googleapis.com/v1beta/properties/${propertyId}:runReport`, {
+    method: 'POST',
+    headers: { Authorization: `Bearer ${token}`, 'Content-Type': 'application/json' },
+    body: JSON.stringify(body),
+  });
+  const data = await res.json();
+  if (!res.ok) throw new Error(data.error?.message || `GA report failed (${res.status})`);
+  return (data.rows || []).map((row) => ({
+    dims: (row.dimensionValues || []).map((d) => d.value),
+    metrics: (row.metricValues || []).map((m) => Number(m.value)),
+  }));
+}
+
+async function getGaSummary(token, propertyId, days) {
+  const dateRanges = [{ startDate: `${days}daysAgo`, endDate: 'today' }];
+  const breakdown = async (dimension, limit) =>
+    (await runGaReport(token, propertyId, {
+      dateRanges,
+      dimensions: [{ name: dimension }],
+      metrics: [{ name: 'activeUsers' }],
+      orderBys: [{ metric: { metricName: 'activeUsers' }, desc: true }],
+      limit,
+    })).map((r) => ({ label: r.dims[0], users: r.metrics[0] }));
+  const [totals, cities, countries, ages, genders] = await Promise.all([
+    runGaReport(token, propertyId, {
+      dateRanges,
+      metrics: [{ name: 'activeUsers' }, { name: 'newUsers' }, { name: 'sessions' }, { name: 'screenPageViews' }],
+    }),
+    breakdown('city', 8),
+    breakdown('country', 5),
+    // Age/gender only populate with Google signals on, and GA withholds them
+    // under its privacy thresholds — empty is normal for small sites.
+    breakdown('userAgeBracket', 8),
+    breakdown('userGender', 4),
+  ]);
+  const t = totals[0]?.metrics || [0, 0, 0, 0];
+  const known = (list) => list.filter((x) => x.label && x.label !== '(not set)' && x.label !== 'unknown');
+  return {
+    visitors: t[0], newVisitors: t[1], sessions: t[2], pageViews: t[3],
+    cities: known(cities), countries: known(countries), ages: known(ages), genders: known(genders),
+  };
+}
+
+async function getSearchConsoleSummary(token, siteUrl, days) {
+  const end = new Date(Date.now() - 2 * 86400000); // Search Console lags ~2 days
+  const start = new Date(end.getTime() - days * 86400000);
+  const ymd = (d) => d.toISOString().slice(0, 10);
+  const query = async (body) => {
+    const res = await fetch(
+      `https://www.googleapis.com/webmasters/v3/sites/${encodeURIComponent(siteUrl)}/searchAnalytics/query`,
+      {
+        method: 'POST',
+        headers: { Authorization: `Bearer ${token}`, 'Content-Type': 'application/json' },
+        body: JSON.stringify({ startDate: ymd(start), endDate: ymd(end), ...body }),
+      }
+    );
+    const data = await res.json();
+    if (!res.ok) throw new Error(data.error?.message || `Search Console query failed (${res.status})`);
+    return data.rows || [];
+  };
+  const [totals, queries] = await Promise.all([query({}), query({ dimensions: ['query'], rowLimit: 10 })]);
+  const t = totals[0] || {};
+  return {
+    clicks: t.clicks || 0,
+    impressions: t.impressions || 0,
+    ctr: t.ctr || 0,
+    position: t.position || 0,
+    topQueries: queries.map((r) => ({
+      query: r.keys[0], clicks: r.clicks, impressions: r.impressions, position: r.position,
+    })),
+  };
+}
+
+// Website analytics for the admin: GA4 + Search Console, each reported
+// independently so one misconfigured account doesn't hide the other.
+app.get('/api/crm/clients/:slug/web-analytics', requireClientAdminPassword, async (req, res) => {
+  try {
+    const { CrmClientModel } = await ensureModels();
+    const client = await CrmClientModel.findOne({ slug: req.params.slug }).lean();
+    const settings = clientTrackingSettings(client);
+    const days = Math.min(Math.max(parseInt(req.query.days, 10) || 28, 1), 365);
+    const serviceAccountEmail = process.env.GOOGLE_SERVICE_ACCOUNT_EMAIL || '';
+
+    let token = '';
+    let authError = '';
+    if (settings.gaPropertyId || settings.searchConsoleSiteUrl) {
+      try {
+        token = await getGoogleAccessToken();
+        if (!token) authError = 'Google service account is not configured on the backend.';
+      } catch (error) {
+        authError = error.message;
+      }
+    }
+
+    const section = async (configured, load) => {
+      if (!configured) return { connected: false };
+      if (!token) return { connected: true, error: authError };
+      try {
+        return { connected: true, data: await load() };
+      } catch (error) {
+        return { connected: true, error: error.message };
+      }
+    };
+
+    const [ga, searchConsole] = await Promise.all([
+      section(settings.gaPropertyId, () => getGaSummary(token, settings.gaPropertyId, days)),
+      section(settings.searchConsoleSiteUrl, () => getSearchConsoleSummary(token, settings.searchConsoleSiteUrl, days)),
+    ]);
+    res.json({ ok: true, days, serviceAccountEmail, ga, searchConsole });
+  } catch (error) {
+    console.error('Could not load web analytics', error);
+    res.status(500).json({ ok: false, message: 'Could not load web analytics.' });
+  }
+});
 
 module.exports = app;
 module.exports.handler = serverless(app);

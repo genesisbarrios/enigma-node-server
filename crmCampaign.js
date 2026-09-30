@@ -36,6 +36,12 @@ const crmCampaignSchema = new Schema(
       },
     ],
     recipientCount: { type: Number, default: 0 },
+    // Set only when the client asked to send this later instead of right
+    // away — Resend holds and delivers each recipient's email at this time
+    // (see email.js's sendCrmCampaignEmail). Absent entirely for a normal
+    // immediate send, which is what every campaign before this field
+    // existed already was.
+    scheduledAt: Date,
   },
   {
     timestamps: true,

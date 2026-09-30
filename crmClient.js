@@ -19,6 +19,15 @@ const crmClientSchema = new Schema(
     website: String,
     instagram: String,
     googleBusinessUrl: String,
+    // Tracking/analytics accounts the client connects from their admin's
+    // "Connect accounts" panel. The first three are public tag IDs the site
+    // loads on every page; gaPropertyId/searchConsoleSiteUrl are only used
+    // server-side to read reports with Enigma's service account.
+    gtmId: String,
+    gaMeasurementId: String,
+    metaPixelId: String,
+    gaPropertyId: String,
+    searchConsoleSiteUrl: String,
   },
   {
     timestamps: true,
