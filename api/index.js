@@ -916,7 +916,7 @@ app.use('/api', router);
 // Click tracking, per-client tracking IDs (GTM / GA4 / Meta Pixel), and
 // GA4 + Search Console reports for each client site's admin.
 
-const CRM_EVENT_TYPES = ['phone_click', 'email_click', 'social_click'];
+const CRM_EVENT_TYPES = ['page_view', 'phone_click', 'email_click', 'social_click'];
 
 // Public tag IDs get injected into every page's <script>, so they're
 // strictly validated here — never trust admin input inside a script tag.
@@ -949,11 +949,13 @@ app.post('/api/crm/events', async (req, res) => {
       { $setOnInsert: { slug: clientSlug, name: String(req.body.clientName || clientSlug).slice(0, 100) } },
       { upsert: true }
     );
+    const visitorId = String(req.body.visitorId || '');
     await CrmEventModel.create({
       clientSlug,
       type,
       label: String(req.body.label || '').slice(0, 60),
       path: String(req.body.path || '').slice(0, 200),
+      ...(/^[a-z0-9-]{8,40}$/.test(visitorId) ? { visitorId } : {}),
     });
     res.status(201).json({ ok: true });
   } catch (error) {
@@ -971,7 +973,7 @@ app.get('/api/crm/clients/:slug/stats', requireClientAdminPassword, async (req, 
     const days = Math.min(Math.max(parseInt(req.query.days, 10) || 0, 0), 3650);
     const since = days ? { createdAt: { $gte: new Date(Date.now() - days * 86400000) } } : {};
 
-    const [newsletterSignups, contactSubmissions, clickGroups, socialGroups] = await Promise.all([
+    const [newsletterSignups, contactSubmissions, clickGroups, socialGroups, visitorGroups] = await Promise.all([
       CrmSubscriberModel.countDocuments({ clientSlug: slug, source: 'newsletter', ...since }),
       CrmSubscriberModel.countDocuments({ clientSlug: slug, source: 'contact_form', ...since }),
       CrmEventModel.aggregate([{ $match: { clientSlug: slug, ...since } }, { $group: { _id: '$type', n: { $sum: 1 } } }]),
@@ -980,11 +982,19 @@ app.get('/api/crm/clients/:slug/stats', requireClientAdminPassword, async (req, 
         { $group: { _id: '$label', n: { $sum: 1 } } },
         { $sort: { n: -1 } },
       ]),
+      // Unique visitors = distinct anonymous visitor IDs among page views.
+      CrmEventModel.aggregate([
+        { $match: { clientSlug: slug, type: 'page_view', visitorId: { $exists: true }, ...since } },
+        { $group: { _id: '$visitorId' } },
+        { $count: 'n' },
+      ]),
     ]);
     const clicks = Object.fromEntries(clickGroups.map((g) => [g._id, g.n]));
     res.json({
       ok: true,
       days,
+      visitors: visitorGroups[0]?.n || 0,
+      pageViews: clicks.page_view || 0,
       newsletterSignups,
       contactSubmissions,
       phoneClicks: clicks.phone_click || 0,

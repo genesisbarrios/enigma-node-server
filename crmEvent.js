@@ -1,9 +1,9 @@
 const mongoose = require("mongoose");
 const Schema = mongoose.Schema;
 
-// One tracked click on a client website — a phone link, email link, or
-// social profile link. Recorded through the site's own /api/crm/events proxy
-// and counted on the admin's Mailing List & Analytics cards.
+// One tracked event on a client website — a page view, or a click on a
+// phone, email, or social profile link. Recorded through the site's own
+// /api/crm/events proxy and counted on the admin's Site Activity cards.
 const crmEventSchema = new Schema(
   {
     clientSlug: {
@@ -13,12 +13,15 @@ const crmEventSchema = new Schema(
     },
     type: {
       type: String,
-      enum: ["phone_click", "email_click", "social_click"],
+      enum: ["page_view", "phone_click", "email_click", "social_click"],
       required: true,
     },
     // e.g. "instagram", "facebook" for social clicks
     label: String,
     path: String,
+    // Anonymous random ID the site keeps in the visitor's localStorage — only
+    // used to count unique visitors, never tied to a person.
+    visitorId: String,
   },
   {
     timestamps: true,
