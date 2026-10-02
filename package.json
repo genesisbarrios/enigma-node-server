@@ -28,5 +28,8 @@
     "mongodb": "^6.3.0",
     "mongoose": "^8.0.4",
     "serverless-http": "^3.2.0"
+  },
+  "engines": {
+    "node": "24.x"
   }
 }
