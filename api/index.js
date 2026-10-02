@@ -5,6 +5,7 @@ const crmClientSchema = require('../crmClient');
 const crmSubscriberSchema = require('../crmSubscriber');
 const crmCampaignSchema = require('../crmCampaign');
 const crmEventSchema = require('../crmEvent');
+const crmOrderSchema = require('../crmOrder');
 const { createSign } = require('crypto');
 const { connectGenwavDb, connectEnigmaDb, connectEnigmaCrmDb } = require('../connectdb');
 const leadsRouter = require('../leads');
@@ -55,6 +56,8 @@ const corsOptions = {
 };
 
 app.use(express.json());
+// ePayco's confirmation call can arrive as a regular form POST.
+app.use(express.urlencoded({ extended: false }));
 app.use(cors(corsOptions));
 app.options('*', cors(corsOptions));
 
@@ -108,6 +111,7 @@ let CrmClientModel;
 let CrmSubscriberModel;
 let CrmCampaignModel;
 let CrmEventModel;
+let CrmOrderModel;
 
 async function ensureModels() {
   if (!UserModel) {
@@ -126,12 +130,13 @@ async function ensureModels() {
     OnboardingClientModel = enigmaConnection.model('OnboardingClient', onboardingClientSchema, 'onboard');
   }
 
-  if (!CrmClientModel || !CrmSubscriberModel || !CrmCampaignModel || !CrmEventModel) {
+  if (!CrmClientModel || !CrmSubscriberModel || !CrmCampaignModel || !CrmEventModel || !CrmOrderModel) {
     const enigmaCrmConnection = await connectEnigmaCrmDb();
     CrmClientModel = enigmaCrmConnection.model('CrmClient', crmClientSchema, 'clients');
     CrmSubscriberModel = enigmaCrmConnection.model('CrmSubscriber', crmSubscriberSchema, 'subscribers');
     CrmCampaignModel = enigmaCrmConnection.model('CrmCampaign', crmCampaignSchema, 'campaigns');
     CrmEventModel = enigmaCrmConnection.model('CrmEvent', crmEventSchema, 'events');
+    CrmOrderModel = enigmaCrmConnection.model('CrmOrder', crmOrderSchema, 'orders');
   }
 
   return {
@@ -142,7 +147,8 @@ async function ensureModels() {
     CrmClientModel,
     CrmSubscriberModel,
     CrmCampaignModel,
-    CrmEventModel
+    CrmEventModel,
+    CrmOrderModel
   };
 }
 
@@ -926,6 +932,8 @@ const TRACKING_FIELD_PATTERNS = {
   metaPixelId: /^\d{8,20}$/,
   gaPropertyId: /^\d{5,15}$/,
   searchConsoleSiteUrl: /^(sc-domain:[a-z0-9.-]+\.[a-z]{2,}|https?:\/\/[^\s"'<>]+\/)$/i,
+  // ePayco P_CUST_ID_CLIENTE — orders are only accepted from this account.
+  epaycoCustId: /^\d{3,12}$/,
 };
 
 function clientTrackingSettings(client) {
@@ -1205,6 +1213,182 @@ app.get('/api/crm/clients/:slug/web-analytics', requireClientAdminPassword, asyn
   } catch (error) {
     console.error('Could not load web analytics', error);
     res.status(500).json({ ok: false, message: 'Could not load web analytics.' });
+  }
+});
+
+// ── Orders (ePayco payment links) ─────────────────────────────────────────
+// Every way an order arrives — ePayco's confirmation call, the buyer
+// landing on the site's /order-complete page, or the client pasting a
+// reference into the admin — goes through recordEpaycoOrder(), which fetches
+// the transaction from ePayco's own validation API. Payment data is never
+// taken from the caller, so nobody can fake an order by hitting these URLs.
+
+const EPAYCO_STATUS = { 1: 'paid', 2: 'rejected', 3: 'pending', 4: 'failed' };
+
+async function fetchEpaycoTransaction(refPayco) {
+  const res = await fetch(`https://secure.epayco.co/validation/v1/reference/${encodeURIComponent(refPayco)}`);
+  const json = await res.json().catch(() => ({}));
+  if (!json || !json.success && !json.status || !json.data || !json.data.x_ref_payco) return null;
+  return json.data;
+}
+
+async function recordEpaycoOrder(clientSlug, refPayco) {
+  const ref = String(refPayco || '').trim();
+  if (!/^[A-Za-z0-9-]{4,40}$/.test(ref)) return { ok: false, status: 400, message: 'Invalid reference.' };
+
+  const { CrmClientModel, CrmOrderModel } = await ensureModels();
+  const client = await CrmClientModel.findOne({ slug: clientSlug }).lean();
+  if (!client) return { ok: false, status: 404, message: 'Unknown client.' };
+  if (!client.epaycoCustId) {
+    return { ok: false, status: 409, message: 'Set the ePayco customer ID in the admin before importing orders.' };
+  }
+
+  const data = await fetchEpaycoTransaction(ref);
+  if (!data) return { ok: false, status: 404, message: 'ePayco has no transaction with that reference.' };
+
+  // Only accept transactions paid to this client's own ePayco account.
+  const custId = String(data.x_cust_id_cliente || '');
+  if (custId && custId !== String(client.epaycoCustId)) {
+    return { ok: false, status: 403, message: 'That transaction belongs to a different ePayco account.' };
+  }
+  if (!custId) console.warn(`ePayco validation for ${ref} had no x_cust_id_cliente — recorded without account check`);
+
+  const paymentStatus = EPAYCO_STATUS[Number(data.x_cod_response)] || 'pending';
+  const name = [data.x_customer_name, data.x_customer_lastname].filter(Boolean).join(' ');
+  const order = await CrmOrderModel.findOneAndUpdate(
+    { clientSlug, refPayco: String(data.x_ref_payco) },
+    {
+      $set: {
+        transactionId: String(data.x_transaction_id || ''),
+        invoice: String(data.x_id_invoice || ''),
+        paymentStatus,
+        amount: Number(data.x_amount) || 0,
+        currency: String(data.x_currency_code || ''),
+        description: String(data.x_description || '').slice(0, 300),
+        paymentMethod: String(data.x_franchise || data.x_bank_name || ''),
+        transactionDate: String(data.x_transaction_date || ''),
+        testMode: String(data.x_test_request) === 'TRUE' || data.x_test_request === true,
+        customer: {
+          name,
+          email: String(data.x_customer_email || ''),
+          phone: String(data.x_customer_phone || data.x_customer_movil || ''),
+          address: String(data.x_customer_address || ''),
+          city: String(data.x_customer_city || ''),
+          country: String(data.x_customer_country || ''),
+          document: String(data.x_customer_document || ''),
+        },
+      },
+      $setOnInsert: { clientSlug, refPayco: String(data.x_ref_payco), fulfillment: 'new' },
+    },
+    { new: true, upsert: true }
+  ).lean();
+  return { ok: true, order };
+}
+
+// Public: ePayco's confirmation call (GET or POST, form or JSON).
+app.all('/api/crm/epayco/confirmation/:slug', async (req, res) => {
+  try {
+    const ref = (req.body && (req.body.x_ref_payco || req.body.ref_payco)) || req.query.x_ref_payco || req.query.ref_payco;
+    const result = await recordEpaycoOrder(req.params.slug, ref);
+    if (!result.ok) console.warn('ePayco confirmation not recorded', req.params.slug, ref, result.message);
+  } catch (error) {
+    console.error('ePayco confirmation failed', error);
+  }
+  // Always 200 so ePayco doesn't keep retrying a reference we've handled.
+  res.status(200).send('ok');
+});
+
+// Public: the site's /order-complete page reports what the buyer paid —
+// returns only the payment status, never customer details.
+app.post('/api/crm/clients/:slug/orders/confirm', async (req, res) => {
+  try {
+    const result = await recordEpaycoOrder(req.params.slug, req.body.refPayco);
+    if (!result.ok) return res.status(result.status).json({ ok: false, message: result.message });
+    const { paymentStatus, amount, currency, description } = result.order;
+    res.json({ ok: true, paymentStatus, amount, currency, description });
+  } catch (error) {
+    console.error('Order confirm failed', error);
+    res.status(500).json({ ok: false, message: 'Could not check the payment.' });
+  }
+});
+
+app.get('/api/crm/clients/:slug/orders', requireClientAdminPassword, async (req, res) => {
+  try {
+    const { CrmOrderModel } = await ensureModels();
+    const orders = await CrmOrderModel.find({ clientSlug: req.params.slug }).sort({ createdAt: -1 }).limit(1000).lean();
+    res.json({ ok: true, orders });
+  } catch (error) {
+    console.error('Could not load orders', error);
+    res.status(500).json({ ok: false, message: 'Could not load orders.' });
+  }
+});
+
+// Admin: add an order by its ePayco reference (e.g. if the confirmation
+// call never arrived).
+app.post('/api/crm/clients/:slug/orders/import', requireClientAdminPassword, async (req, res) => {
+  try {
+    const result = await recordEpaycoOrder(req.params.slug, req.body.refPayco);
+    if (!result.ok) return res.status(result.status).json({ ok: false, message: result.message });
+    res.json({ ok: true, order: result.order });
+  } catch (error) {
+    console.error('Order import failed', error);
+    res.status(500).json({ ok: false, message: 'Could not import the order.' });
+  }
+});
+
+const escapeHtml = (value) =>
+  String(value || '').replace(/[&<>"']/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
+
+// Admin: update fulfillment — Shipped (with carrier/tracking), Delivered,
+// Cancelled, notes. Marking shipped with notifyCustomer emails the buyer.
+app.patch('/api/crm/clients/:slug/orders/:id', requireClientAdminPassword, async (req, res) => {
+  try {
+    const { CrmOrderModel, CrmClientModel } = await ensureModels();
+    const order = await CrmOrderModel.findOne({ _id: req.params.id, clientSlug: req.params.slug });
+    if (!order) return res.status(404).json({ ok: false, message: 'Order not found.' });
+
+    const { fulfillment, carrier, trackingNumber, notes, notifyCustomer } = req.body;
+    if (fulfillment !== undefined) {
+      if (!['new', 'shipped', 'delivered', 'cancelled'].includes(fulfillment)) {
+        return res.status(400).json({ ok: false, message: 'Invalid status.' });
+      }
+      if (fulfillment === 'shipped' && order.fulfillment !== 'shipped') order.shippedAt = new Date();
+      if (fulfillment === 'delivered' && order.fulfillment !== 'delivered') order.deliveredAt = new Date();
+      order.fulfillment = fulfillment;
+    }
+    if (carrier !== undefined) order.carrier = String(carrier).slice(0, 80);
+    if (trackingNumber !== undefined) order.trackingNumber = String(trackingNumber).slice(0, 120);
+    if (notes !== undefined) order.notes = String(notes).slice(0, 2000);
+
+    let emailResult = null;
+    if (notifyCustomer && order.fulfillment === 'shipped' && order.customer?.email) {
+      const client = await CrmClientModel.findOne({ slug: req.params.slug }).lean();
+      const clientName = client?.name || req.params.slug;
+      const tracking = order.trackingNumber
+        ? `<p style="margin:0 0 12px;color:#444;">${order.carrier ? `${escapeHtml(order.carrier)} tracking number` : 'Tracking number'}: <strong>${escapeHtml(order.trackingNumber)}</strong></p>`
+        : '';
+      emailResult = await sendCrmCampaignEmail({
+        to: order.customer.email,
+        name: order.customer.name,
+        clientName,
+        subject: `Your ${clientName} order has shipped`,
+        replyTo: client?.contactEmail || '',
+        html: `<div style="font-family:Helvetica,Arial,sans-serif;max-width:520px;margin:0 auto;padding:24px;">
+          <p style="margin:0 0 12px;color:#444;">Hi (name),</p>
+          <p style="margin:0 0 12px;color:#444;">Good news — your order${order.description ? ` (${escapeHtml(order.description)})` : ''} is on its way.</p>
+          ${tracking}
+          <p style="margin:0 0 12px;color:#444;">Order reference: ${escapeHtml(order.refPayco)}</p>
+          <p style="margin:24px 0 0;color:#333;font-weight:bold;">${escapeHtml(clientName)}</p>
+        </div>`,
+      });
+      if (emailResult.ok) order.shippedEmailSentAt = new Date();
+    }
+
+    await order.save();
+    res.json({ ok: true, order: order.toObject(), email: emailResult });
+  } catch (error) {
+    console.error('Could not update order', error);
+    res.status(500).json({ ok: false, message: 'Could not update the order.' });
   }
 });
 
